@@ -2,250 +2,341 @@ import asyncio
 import imaplib
 import email
 from email.header import decode_header
-from bs4 import BeautifulSoup
-from aiogram import Bot, Dispatcher
-from aiogram.types import Message
+from bs4 import BeautifulSoup, Comment
+from aiogram import Bot
 from aiogram.types import FSInputFile
 import os
-from datetime import datetime
 import logging
 import tempfile
-import pathlib
-import base64
-from config import settings
+import chardet
+import html
+from app.config import settings
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# Initialize bot and dispatcher
 bot = Bot(token=settings.BOT_TOKEN)
-dp = Dispatcher()
+
+TELEGRAM_ALLOWED_TAGS = [
+    "b",
+    "strong",
+    "i",
+    "em",
+    "u",
+    "ins",
+    "s",
+    "strike",
+    "del",
+    "a",
+    "code",
+    "pre",
+]
+TELEGRAM_MESSAGE_LIMIT = 4096
+
+
+def decode_payload(payload: bytes) -> str:
+    detected = chardet.detect(payload).get("encoding") or "utf-8"
+    try:
+        return payload.decode(detected, errors="ignore")
+    except (UnicodeDecodeError, LookupError):
+        return payload.decode("utf-8", errors="ignore")
+
+
+def sanitize_html_for_telegram(html_content: str) -> str:
+    """Очищает HTML, оставляя только теги, поддерживаемые Telegram."""
+    if not html_content:
+        return ""
+
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    for unwanted_tag in soup.find_all(["style", "script"]):
+        unwanted_tag.decompose()
+
+    comments = soup.find_all(string=lambda text: isinstance(text, Comment))
+    for comment in comments:
+        comment.extract()
+
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+
+    for tag in soup.find_all(True):
+        if tag.name not in TELEGRAM_ALLOWED_TAGS:
+            tag.unwrap()
+        else:
+            if tag.name == "a":
+                href = tag.get("href")
+                tag.attrs = {}
+                if href:
+                    tag["href"] = href
+            else:
+                tag.attrs = {}
+
+    return str(soup).strip()
+
+
+def truncate_telegram_html(text: str, max_len: int) -> str:
+    if max_len <= 0:
+        return ""
+    if len(text) <= max_len:
+        return text
+
+    cut = text[:max_len]
+    last_lt = cut.rfind("<")
+    last_gt = cut.rfind(">")
+    if last_lt > last_gt:
+        cut = cut[:last_lt]
+
+    soup = BeautifulSoup(cut, "html.parser")
+    result = str(soup).strip()
+    if len(result) > max_len:
+        result = result[:max_len]
+    return result
+
 
 def decode_email_header(header):
-    """Decode email header from various encodings"""
+    """Декодирует заголовок письма из различных кодировок"""
     if not header:
-        return "Unknown"
+        return "Неизвестно"
     try:
         decoded_list = decode_header(header)
         result = ""
         for content, encoding in decoded_list:
             if isinstance(content, bytes):
-                if encoding:
-                    try:
-                        # Try to decode with specified encoding
-                        result += content.decode(encoding)
-                    except:
-                        try:
-                            # If that fails, try base64 decoding
-                            decoded_str = base64.b64decode(content).decode('utf-8')
-                            result += decoded_str
-                        except:
-                            # If all else fails, try utf-8 with ignore errors
-                            result += content.decode('utf-8', errors='ignore')
-                else:
-                    try:
-                        # Try base64 decoding first
-                        decoded_str = base64.b64decode(content).decode('utf-8')
-                        result += decoded_str
-                    except:
-                        # If that fails, try utf-8 with ignore errors
-                        result += content.decode('utf-8', errors='ignore')
+                try:
+                    if not encoding:
+                        encoding = chardet.detect(content)["encoding"] or "utf-8"
+                    result += content.decode(encoding, errors="ignore")
+                except (UnicodeDecodeError, LookupError):
+                    result += content.decode("utf-8", errors="ignore")
             else:
-                result += content
+                result += str(content)
         return result.strip()
     except Exception as e:
-        logger.error(f"Error decoding header: {e}")
-        return header
+        logger.error(f"Ошибка при декодировании заголовка: {e}")
+        return str(header)
+
 
 def decode_email_subject(subject):
-    """Decode email subject from various encodings"""
     return decode_email_header(subject)
 
+
 def decode_email_from(from_addr):
-    """Decode email from address from various encodings"""
     try:
-        # Split the from address into name and email parts
-        parts = from_addr.split('<')
-        if len(parts) == 1:
-            return decode_email_header(from_addr)
-        
-        name = decode_email_header(parts[0].strip())
-        email_addr = parts[1].strip('>')
-        return f"{name} <{email_addr}>"
+        if "<" in from_addr and ">" in from_addr:
+            name, addr = email.utils.parseaddr(from_addr)
+            decoded_name = decode_email_header(name)
+            return f"{decoded_name} <{addr}>"
+        return decode_email_header(from_addr)
     except Exception as e:
-        logger.error(f"Error decoding from address: {e}")
+        logger.error(f"Ошибка при декодировании адреса отправителя: {e}")
         return from_addr
 
+
 def get_email_content(email_message):
-    """Extract text content from email"""
+    """
+    Извлекает содержимое из письма. Приоритет у HTML.
+    Возвращает кортеж (содержимое, тип_содержимого: 'HTML' или 'TEXT').
+    """
+    text_content = ""
+    html_content = ""
+
     try:
-        text_content = ""
-        html_content = ""
-        
         if email_message.is_multipart():
             for part in email_message.walk():
-                if part.get_content_type() == "text/plain":
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        text_content = payload.decode()
-                elif part.get_content_type() == "text/html":
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        html_content = payload.decode()
+                content_type = part.get_content_type()
+                if (
+                    part.get_content_maintype() == "multipart"
+                    or part.get("Content-Disposition")
+                ):
+                    continue
+
+                payload = part.get_payload(decode=True)
+                if not payload:
+                    continue
+
+                decoded_text = decode_payload(payload)
+
+                if content_type == "text/plain":
+                    text_content = decoded_text
+                elif content_type == "text/html":
+                    html_content = decoded_text
         else:
-            if email_message.get_content_type() == "text/plain":
-                payload = email_message.get_payload(decode=True)
-                if payload:
-                    text_content = payload.decode()
-            elif email_message.get_content_type() == "text/html":
-                payload = email_message.get_payload(decode=True)
-                if payload:
-                    html_content = payload.decode()
-        
-        # If we have plain text, use it
-        if text_content:
-            return text_content.strip()
-        
-        # If we have HTML, convert it to plain text
+            payload = email_message.get_payload(decode=True)
+            if payload:
+                content_type = email_message.get_content_type()
+                decoded_text = decode_payload(payload)
+
+                if content_type == "text/html":
+                    html_content = decoded_text
+                else:
+                    text_content = decoded_text
+
         if html_content:
-            soup = BeautifulSoup(html_content, 'html.parser')
-            return soup.get_text(separator='\n', strip=True)
-        
-        return "No text content found"
+            return (sanitize_html_for_telegram(html_content), "HTML")
+        if text_content:
+            return (text_content.strip(), "TEXT")
+
+        return ("Нет текста в письме", "TEXT")
     except Exception as e:
-        logger.error(f"Error getting email content: {e}")
-        return "Error extracting email content"
+        logger.error(f"Ошибка при извлечении текста письма: {e}")
+        return ("Ошибка при извлечении текста письма", "TEXT")
+
 
 def get_email_attachments(email_message):
-    """Extract attachments from email"""
     attachments = []
     try:
-        if email_message.is_multipart():
-            for part in email_message.walk():
-                if part.get_content_maintype() == 'multipart':
-                    continue
-                if part.get('Content-Disposition') is None:
-                    continue
+        for part in email_message.walk():
+            if (
+                part.get_content_maintype() == "multipart"
+                or part.get("Content-Disposition") is None
+            ):
+                continue
 
-                filename = part.get_filename()
-                if filename:
-                    filename = decode_email_header(filename)
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        attachments.append((filename, payload))
+            filename = part.get_filename()
+            if filename:
+                decoded_filename = decode_email_header(filename)
+                payload = part.get_payload(decode=True)
+                if payload:
+                    attachments.append((decoded_filename, payload))
     except Exception as e:
-        logger.error(f"Error getting attachments: {e}")
+        logger.error(f"Ошибка при получении вложений: {e}")
     return attachments
 
+
 async def check_new_emails():
-    """Check for new emails and send them to Telegram"""
+    imap = None
     try:
         imap = imaplib.IMAP4_SSL(settings.MAIL_SERVER)
         imap.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
-        
-        # Select inbox
         imap.select("INBOX")
-        
-        # Search for unread emails
+
         _, message_numbers = imap.search(None, "UNSEEN")
-        
+
         if not message_numbers or not message_numbers[0]:
-            logger.info("No new emails found")
+            logger.info("Нет новых писем")
             return
-            
+
         for num in message_numbers[0].split():
             try:
                 _, msg_data = imap.fetch(num, "(RFC822)")
-                if not msg_data or not msg_data[0] or not msg_data[0][1]:
-                    logger.error(f"Empty message data for message {num}")
+                if not msg_data or not isinstance(msg_data[0], tuple):
+                    logger.error(f"Пустое или некорректное сообщение {num}")
                     continue
-                    
-                email_body = msg_data[0][1]
-                email_message = email.message_from_bytes(email_body)
-                
-                # Get email details
-                subject = decode_email_subject(email_message.get("subject", ""))
-                from_addr = decode_email_from(email_message.get("from", "Unknown"))
-                date = email_message.get("date", "Unknown")
-                
-                # Get email content
-                content = get_email_content(email_message)
-                
-                # Prepare message
-                message = f"📧 New email received!\n\n"
-                message += f"From: {from_addr}\n"
-                message += f"Subject: {subject}\n"
-                message += f"Date: {date}\n\n"
-                message += f"Content:\n{content[:4000]}"  # Limit content length
-                
-                # Send text content to Telegram
-                await bot.send_message(chat_id=settings.CHAT_ID, text=message)
-                
-                # Handle attachments
+
+                email_message = email.message_from_bytes(msg_data[0][1])
+
+                subject = decode_email_subject(
+                    email_message.get("subject", "Без темы")
+                )
+                from_addr = decode_email_from(
+                    email_message.get("from", "Неизвестный отправитель")
+                )
+
+                content, content_type = get_email_content(email_message)
+
+                from_addr_safe = html.escape(from_addr)
+                subject_safe = html.escape(subject)
+
+                if content_type == "HTML":
+                    content_body = content
+                else:
+                    content_body = html.escape(content)
+
+                header_part = (
+                    f"<b>От кого:</b> {from_addr_safe}\n"
+                    f"<b>Тема:</b> {subject_safe}\n"
+                )
+
+                max_body_len = TELEGRAM_MESSAGE_LIMIT - len(header_part) - 1
+                message_text = header_part + truncate_telegram_html(
+                    content_body, max_body_len
+                )
+
+                await bot.send_message(
+                    chat_id=settings.CHAT_ID,
+                    text=message_text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+
                 attachments = get_email_attachments(email_message)
-                for filename, content in attachments:
+                for filename, file_data in attachments:
                     try:
-                        if not content:
-                            logger.warning(f"Empty content for attachment {filename}")
+                        if not file_data:
+                            logger.warning(f"Пустое вложение {filename}")
                             continue
-                            
-                        # Create a temporary directory
+
                         with tempfile.TemporaryDirectory() as temp_dir:
-                            # Create a safe filename
-                            safe_filename = "".join(c for c in filename if c.isalnum() or c in (' ', '-', '_', '.'))
+                            safe_filename = "".join(
+                                c
+                                for c in filename
+                                if c.isalnum() or c in (" ", "-", "_", ".")
+                            ) or "attachment"
                             file_path = os.path.join(temp_dir, safe_filename)
-                            
-                            # Save attachment
+
                             with open(file_path, "wb") as f:
-                                f.write(content)
-                            
-                            # Send file to Telegram using FSInputFile
-                            file = FSInputFile(file_path)
+                                f.write(file_data)
+
+                            input_file = FSInputFile(
+                                file_path, filename=safe_filename
+                            )
                             await bot.send_document(
                                 chat_id=settings.CHAT_ID,
-                                document=file,
-                                caption=f"📎 Attachment: {safe_filename}"
+                                document=input_file,
+                                caption=f"Вложение: {html.escape(safe_filename)}",
                             )
-                                
                     except Exception as e:
-                        logger.error(f"Error sending attachment {filename}: {e}")
-                        # Try to send error message to Telegram
+                        logger.error(
+                            f"Ошибка при отправке вложения {filename}: {e}"
+                        )
                         try:
                             await bot.send_message(
                                 chat_id=settings.CHAT_ID,
-                                text=f"❌ Error sending attachment {filename}: {str(e)}"
+                                text=f"Ошибка при отправке вложения: {html.escape(filename)}",
                             )
-                        except:
+                        except Exception:
                             pass
-                            
             except Exception as e:
-                logger.error(f"Error processing message {num}: {e}")
+                logger.error(
+                    f"Ошибка при обработке письма {num}: {e}", exc_info=True
+                )
                 continue
-            
     except Exception as e:
-        logger.error(f"Error checking emails: {e}")
+        logger.error(f"Ошибка при проверке почты: {e}", exc_info=True)
     finally:
+        if imap is None:
+            return
         try:
             imap.close()
-            imap.logout()
-        except:
+        except Exception:
             pass
+        try:
+            imap.logout()
+        except Exception as e:
+            logger.warning(f"Не удалось корректно закрыть IMAP соединение: {e}")
+
 
 async def main():
-    """Main function to run the bot"""
-    while True:
-        try:
-            await check_new_emails()
-            await asyncio.sleep(settings.CHECK_INTERVAL)  # Check every 5 minutes
-        except Exception as e:
-            logger.error(f"Error in main loop: {e}")
-            await asyncio.sleep(settings.RETRY_INTERVAL)  # Wait a minute before retrying
+    try:
+        while True:
+            try:
+                await check_new_emails()
+                await asyncio.sleep(settings.CHECK_INTERVAL)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Ошибка в основном цикле: {e}", exc_info=True)
+                await asyncio.sleep(settings.RETRY_INTERVAL)
+    finally:
+        await bot.session.close()
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        logger.info("Остановка бота пользователем")
     except Exception as e:
-        logger.error(f"Fatal error: {e}") 
+        logger.error(f"Фатальная ошибка: {e}", exc_info=True)

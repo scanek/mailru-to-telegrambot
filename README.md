@@ -1,69 +1,75 @@
 # Mail.ru to Telegram Bot
 
-Telegram bot for forwarding emails from Mail.ru to a specified Telegram chat. Built with Python, Aiogram 3, and IMAP.
+Пересылка новых писем из Mail.ru в Telegram-чат. Python, Aiogram 3, IMAP.
 
-<img src="images/example-image.png" alt="Example Image" width="300">
+## Возможности
 
-🚀 Features
+- Периодическая проверка непрочитанных писем
+- Текст и упрощённый HTML (теги Telegram)
+- Вложения
+- Повтор при ошибке в основном цикле
 
-- Автоматическая проверка новых писем
-- Пересылка текстового содержимого писем
-- Пересылка вложений
-- Поддержка HTML-форматирования
-- Автоматическое декодирование тем писем
-- Обработка ошибок и повторные попытки
+## Требования
 
-📦 Установка и запуск
+- Python 3.13 (на Debian 12 Bookworm системный 3.11 недостаточен — используйте `uv python install 3.13` или Docker)
+- Включённый IMAP в Mail.ru и **пароль приложения**, не пароль ящика
+- Telegram-бот в целевом чате/канале (для `CHAT_ID` вида `-100…` бот должен быть админом)
 
-1. Клонируйте репозиторий:
-
-```bash
-git clone https://github.com/yourusername/mailru-to-telegrambot.git
-cd mailru-to-telegrambot
-```
-
-2. Установите зависимости (используя UV):
+## Установка на Debian
 
 ```bash
-# Установка UV
 curl -LsSf https://astral.sh/uv/install.sh | sh
+source "$HOME/.local/bin/env"
 
-# Установка зависимостей
-# Установить зависимости с помощью uv
-python -m pip install uv
-uv sync --frozen
+cd mailru-to-telegrambot
+uv python install 3.13
+uv sync
+cp .env.example .env
+chmod 600 .env
 ```
 
-Или используя Docker:
+Заполните `.env`, затем:
+
+```bash
+uv run python -m app.main
+```
+
+В логе `Нет новых писем` — IMAP работает. Ошибка login — почта; ошибка Telegram API — токен или `CHAT_ID`.
+
+### systemd (пример)
+
+`/etc/systemd/system/mailru-telegram-bot.service`:
+
+```ini
+[Unit]
+Description=Mail.ru to Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+WorkingDirectory=/opt/mailru-to-telegrambot
+ExecStart=/home/bot/.local/bin/uv run python -m app.main
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now mailru-telegram-bot
+```
+
+## Docker
 
 ```bash
 docker build -t mailru-telegram-bot .
-docker run -d --name mailru-telegram-bot mailru-telegram-bot
+docker run -d --name mailru-telegram-bot --env-file .env --restart unless-stopped mailru-telegram-bot
 ```
 
-3. Создайте файл .env с настройками:
+## Переменные окружения
 
-```env
-# Email settings
-MAIL_USERNAME=your_email@mail.ru
-MAIL_PASSWORD=your_password
-MAIL_SERVER=imap.mail.ru
-
-# Telegram settings
-BOT_TOKEN=your_bot_token
-CHAT_ID=your_chat_id
-
-# Application settings
-CHECK_INTERVAL=300
-RETRY_INTERVAL=60
-```
-
-4. Запустите бота:
-
-```bash
-uv run python3 app/main.py
-```
-
-## Разработчики
-
-Разработано для внутреннего пользования группы БПИ23-01 университета СибГУ
+См. `.env.example`. Исходящие порты: 993 (imap.mail.ru) и 443 (api.telegram.org).

@@ -205,27 +205,46 @@ def get_email_attachments(email_message):
     return attachments
 
 
+def connect_imap():
+    imap = imaplib.IMAP4_SSL(settings.MAIL_SERVER)
+    imap.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
+    imap.select("INBOX")
+    return imap
+
+def fetch_unseen_nums(imap):
+    _, message_numbers = imap.search(None, "UNSEEN")
+    if not message_numbers or not message_numbers[0]:
+        return []
+    return message_numbers[0].split()
+
+def fetch_email_bytes(imap, num):
+    _, msg_data = imap.fetch(num, "(BODY.PEEK[])")
+    if msg_data and isinstance(msg_data[0], tuple):
+        return msg_data[0][1]
+    return None
+
+def mark_seen(imap, num):
+    imap.store(num, '+FLAGS', '\\Seen')
+
+
 async def check_new_emails():
     imap = None
     try:
-        imap = imaplib.IMAP4_SSL(settings.MAIL_SERVER)
-        imap.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
-        imap.select("INBOX")
+        imap = await asyncio.to_thread(connect_imap)
+        msg_nums = await asyncio.to_thread(fetch_unseen_nums, imap)
 
-        _, message_numbers = imap.search(None, "UNSEEN")
-
-        if not message_numbers or not message_numbers[0]:
+        if not msg_nums:
             logger.info("Нет новых писем")
             return
 
-        for num in message_numbers[0].split():
+        for num in msg_nums:
             try:
-                _, msg_data = imap.fetch(num, "(RFC822)")
-                if not msg_data or not isinstance(msg_data[0], tuple):
+                msg_bytes = await asyncio.to_thread(fetch_email_bytes, imap, num)
+                if not msg_bytes:
                     logger.error(f"Пустое или некорректное сообщение {num}")
                     continue
 
-                email_message = email.message_from_bytes(msg_data[0][1])
+                email_message = email.message_from_bytes(msg_bytes)
 
                 subject = decode_email_subject(
                     email_message.get("subject", "Без темы")
@@ -234,15 +253,15 @@ async def check_new_emails():
                     email_message.get("from", "Неизвестный отправитель")
                 )
 
-                content, content_type = get_email_content(email_message)
+                content_str, content_type = get_email_content(email_message)
 
                 from_addr_safe = html.escape(from_addr)
                 subject_safe = html.escape(subject)
 
                 if content_type == "HTML":
-                    content_body = content
+                    content_body = content_str
                 else:
-                    content_body = html.escape(content)
+                    content_body = html.escape(content_str)
 
                 header_part = (
                     f"<b>От кого:</b> {from_addr_safe}\n"
@@ -298,6 +317,10 @@ async def check_new_emails():
                             )
                         except Exception:
                             pass
+                
+                # Помечаем как прочитанное только после успешной отправки в ТГ
+                await asyncio.to_thread(mark_seen, imap, num)
+
             except Exception as e:
                 logger.error(
                     f"Ошибка при обработке письма {num}: {e}", exc_info=True
@@ -309,11 +332,11 @@ async def check_new_emails():
         if imap is None:
             return
         try:
-            imap.close()
+            await asyncio.to_thread(imap.close)
         except Exception:
             pass
         try:
-            imap.logout()
+            await asyncio.to_thread(imap.logout)
         except Exception as e:
             logger.warning(f"Не удалось корректно закрыть IMAP соединение: {e}")
 

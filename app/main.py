@@ -12,10 +12,16 @@ import chardet
 import html
 from app.config import settings
 
+# Настройка логирования: INFO для наших логов, WARNING для внешних библиотек
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Заглушаем технические логи aiogram и http-клиентов
+logging.getLogger("aiogram").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 bot = Bot(token=settings.BOT_TOKEN)
 
@@ -211,11 +217,13 @@ def connect_imap():
     imap.select("INBOX")
     return imap
 
+
 def fetch_unseen_nums(imap):
     _, message_numbers = imap.search(None, "UNSEEN")
     if not message_numbers or not message_numbers[0]:
         return []
     return message_numbers[0].split()
+
 
 def fetch_email_bytes(imap, num):
     _, msg_data = imap.fetch(num, "(BODY.PEEK[])")
@@ -223,8 +231,9 @@ def fetch_email_bytes(imap, num):
         return msg_data[0][1]
     return None
 
+
 def mark_seen(imap, num):
-    imap.store(num, '+FLAGS', '\\Seen')
+    imap.store(num, "+FLAGS", "\\Seen")
 
 
 async def check_new_emails():
@@ -233,8 +242,8 @@ async def check_new_emails():
         imap = await asyncio.to_thread(connect_imap)
         msg_nums = await asyncio.to_thread(fetch_unseen_nums, imap)
 
+        # Если писем нет, ничего не пишем в лог
         if not msg_nums:
-            logger.info("Нет новых писем")
             return
 
         for num in msg_nums:
@@ -317,9 +326,12 @@ async def check_new_emails():
                             )
                         except Exception:
                             pass
-                
-                # Помечаем как прочитанное только после успешной отправки в ТГ
+
+                # Помечаем как прочитанное только после успешной отправки
                 await asyncio.to_thread(mark_seen, imap, num)
+                
+                # Логируем только факт успешной отправки
+                logger.info(f"Отправлено письмо в Telegram | От: {from_addr} | Тема: {subject}")
 
             except Exception as e:
                 logger.error(
